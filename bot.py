@@ -285,8 +285,9 @@ async def update_channel_caption(image_row: dict, tags: Optional[List[str]] = No
 def action_keyboard(image_id: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Редактировать теги", callback_data=f"edit:{image_id}")
+    kb.button(text="🧹 Очистить теги", callback_data=f"clear:{image_id}")
     kb.button(text="🗑 Удалить", callback_data=f"del:{image_id}")
-    kb.adjust(2)
+    kb.adjust(2, 1)  # 1-й ряд: редактировать/очистить; 2-й ряд: удалить
     return kb.as_markup()
 
 async def send_photo_to_channel_from_file_id(
@@ -319,6 +320,23 @@ async def send_photo_to_channel_from_bytes(
         caption=caption,
         parse_mode="HTML",
     )
+
+async def add_image_tags(image_id: int, tags: List[str]):
+    """Добавляет новые теги, старые остаются (дубликаты игнорируются)."""
+    if not tags:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR IGNORE INTO image_tags(image_id, tag) VALUES (?, ?)",
+            [(image_id, t) for t in tags],
+        )
+        await db.commit()
+
+async def clear_image_tags(image_id: int):
+    """Полностью очищает теги картинки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM image_tags WHERE image_id=?", (image_id,))
+        await db.commit()
 
 # --------- COMMANDS ----------
 @dp.message(CommandStart())
@@ -535,15 +553,65 @@ async def on_new_tags(m: Message, state: FSMContext):
         await state.clear()
         return
 
-    tags = normalize_tags(m.text or "")
-    await set_image_tags(image_id, tags)
+    new_tags = normalize_tags(m.text or "")
+    await add_image_tags(image_id, new_tags)  # <-- добавляем, не затираем
+    all_tags = await get_image_tags(image_id)
+
     # обновим подпись в канале
     full_row = await get_image_row_any(image_id)
     if full_row:
-        await update_channel_caption(full_row, tags=tags, mark_deleted=False)
+        await update_channel_caption(full_row, tags=all_tags, mark_deleted=False)
 
-    await m.reply(f"Готово. Новые теги: {tags_to_caption(tags) or '—'}", reply_markup=action_keyboard(image_id))
+    added_line = tags_to_caption(new_tags) or "—"
+    total_line = tags_to_caption(all_tags) or "—"
+    await m.reply(
+        f"Готово. Добавил: {added_line}\nИтоговые теги: {total_line}",
+        reply_markup=action_keyboard(image_id)
+    )
     await state.clear()
+
+@dp.callback_query(F.data.startswith("clear:"))
+async def cb_clear(c: CallbackQuery):
+    image_id = int(c.data.split(":")[1])
+    row = await get_image_by_id(image_id)
+    if not row:
+        await c.answer("Не найдено/удалено.", show_alert=True)
+        return
+    if row["uploader_user_id"] != c.from_user.id:
+        await c.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, очистить", callback_data=f"clearc:{image_id}:yes")
+    kb.button(text="↩️ Отмена", callback_data=f"clearc:{image_id}:no")
+    kb.adjust(2)
+    await c.message.answer("Очистить все теги у изображения?", reply_markup=kb.as_markup())
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("clearc:"))
+async def cb_clear_confirm(c: CallbackQuery):
+    _, image_id_str, choice = c.data.split(":")
+    image_id = int(image_id_str)
+    if choice == "no":
+        await c.answer("Отменено.")
+        await c.message.edit_text("Очистка отменена.")
+        return
+
+    row = await get_image_by_id(image_id)
+    if not row:
+        await c.answer("Не найдено/удалено.", show_alert=True)
+        return
+    if row["uploader_user_id"] != c.from_user.id:
+        await c.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    await clear_image_tags(image_id)
+    full_row = await get_image_row_any(image_id)
+    if full_row:
+        await update_channel_caption(full_row, tags=[], mark_deleted=False)
+
+    await c.message.edit_text("Теги очищены. Теперь у изображения нет тегов.")
+    await c.answer("Готово.")
 
 # --------- DELETE (SOFT; KEEP IN CHANNEL WITH MARK) ----------
 @dp.callback_query(F.data.startswith("del:"))
