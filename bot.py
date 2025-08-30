@@ -24,6 +24,9 @@ from aiogram.fsm.context import FSMContext
 import aiosqlite
 from PIL import Image
 
+import pymorphy3
+morph = pymorphy3.MorphAnalyzer()
+
 # --------- SETTINGS ----------
 try:
     import settings  # файл settings.py должен лежать рядом с bot.py
@@ -97,7 +100,7 @@ def normalize_tags(text: Optional[str]) -> List[str]:
             continue
         if t.startswith("#"):
             t = t[1:]
-        t = re.sub(r"[^a-zA-Zа-яА-Я0-9_\-]+", "", t)
+        t = re.sub(r"[^a-zA-Zа-яА-ЯёЁ0-9_\-]+", "", t)
         if t:
             tags.append(t)
     seen = set()
@@ -224,6 +227,157 @@ async def search_images_for_user(user_id: int, tags: List[str], limit: int, offs
             cur = await db.execute(sql, args)
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+async def search_images_for_user_fts(user_id: int, query: str, limit: int, offset: int) -> List[dict]:
+    base_tokens = normalize_tags(query)
+    if not base_tokens:
+        return await search_images_for_user(user_id, [], limit, offset)
+
+    lemmas = lemmatize_tokens(base_tokens)
+
+    groups = []
+    for i, t in enumerate(base_tokens):
+        lem = lemmas[i] if i < len(lemmas) else t
+        t = t.lower()
+        lem = lem.lower()
+        groups.append(f'({t}* OR {lem}*)' if lem != t else f'{t}*')
+
+    match = " AND ".join(groups)
+
+    sql_bm25 = """
+    SELECT i.*
+    FROM image_fts
+    JOIN images AS i ON i.id = image_fts.rowid
+    WHERE image_fts MATCH ?
+      AND i.uploader_user_id = ?
+      AND i.deleted_at IS NULL
+    ORDER BY bm25(image_fts), i.id DESC
+    LIMIT ? OFFSET ?
+    """
+
+    sql_no_bm25 = """
+    SELECT i.*
+    FROM image_fts
+    JOIN images AS i ON i.id = image_fts.rowid
+    WHERE image_fts MATCH ?
+      AND i.uploader_user_id = ?
+      AND i.deleted_at IS NULL
+    ORDER BY i.id DESC
+    LIMIT ? OFFSET ?
+    """
+
+    import sqlite3
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        try:
+            cur = await db.execute(sql_bm25, (match, user_id, limit, offset))
+            rows = await cur.fetchall()
+        except sqlite3.OperationalError as e:
+            # Фолбэк, если в сборке SQLite нет bm25()
+            if "no such function: bm25" in str(e):
+                cur = await db.execute(sql_no_bm25, (match, user_id, limit, offset))
+                rows = await cur.fetchall()
+            else:
+                raise
+        return [dict(r) for r in rows]
+
+# ---------- FTS5 ----------
+CREATE_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS image_fts USING fts5(
+    content,
+    tokenize = "unicode61 remove_diacritics 2 tokenchars '-_'"
+);
+"""
+
+async def init_fts():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(CREATE_FTS_SQL)
+        await db.commit()
+
+def lemmatize_tokens(tokens: List[str]) -> List[str]:
+    """Лемматизируем русские токены, прочие — оставляем как есть."""
+    lemmas = []
+    for t in tokens:
+        # лемматизируем только кириллицу (включая ё/Ё и дефисы/нижние подчёркивания)
+        if re.fullmatch(r"[а-яА-ЯёЁ][а-яА-ЯёЁ0-9_\-]*", t):
+            try:
+                p = morph.parse(t)[0]
+                lem = p.normal_form
+                if lem:
+                    lemmas.append(lem.lower())
+                    continue
+            except Exception:
+                pass
+        lemmas.append(t.lower())
+    # убираем дубли, сохраняя порядок
+    seen, out = set(), []
+    for x in lemmas:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def build_index_text(tags: List[str], extra: str = "") -> str:
+    """В индекс кладём оригинальные токены + леммы."""
+    tags = [t.lower() for t in tags]
+    lemmas = lemmatize_tokens(tags)
+    # порядок: сначала оригиналы, потом леммы (без дублей)
+    all_tokens = []
+    seen = set()
+    for t in tags + lemmas:
+        if t and t not in seen:
+            seen.add(t)
+            all_tokens.append(t)
+    if extra:
+        all_tokens.append(extra)
+    return " ".join(all_tokens).strip()
+
+async def fts_upsert(image_id: int, content: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # стандартный delete → insert вместо спец-команды FTS5
+        await db.execute("DELETE FROM image_fts WHERE rowid = ?", (image_id,))
+        await db.execute("INSERT INTO image_fts(rowid, content) VALUES(?, ?)", (image_id, content))
+        await db.commit()
+
+async def fts_delete(image_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM image_fts WHERE rowid = ?", (image_id,))
+        await db.commit()
+
+async def ensure_fts_backfilled():
+    """На старте: если FTS пуст/неполон — пересобрать индекс. Работает в одном соединении."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # сколько актуальных изображений
+        c1 = await db.execute("SELECT COUNT(*) AS c FROM images WHERE deleted_at IS NULL")
+        total = (await c1.fetchone())["c"]
+
+        # сколько записей в FTS
+        try:
+            c2 = await db.execute("SELECT COUNT(*) AS c FROM image_fts")
+            total_fts = (await c2.fetchone())["c"]
+        except Exception:
+            total_fts = 0
+
+        if total_fts >= total:
+            return  # индекс уже в норме
+
+        # достраиваем индекс
+        cur = await db.execute("SELECT id FROM images WHERE deleted_at IS NULL ORDER BY id")
+        rows = await cur.fetchall()
+        for r in rows:
+            image_id = r["id"]
+            tcur = await db.execute("SELECT tag FROM image_tags WHERE image_id=?", (image_id,))
+            tags = [x[0] for x in await tcur.fetchall()]
+
+            # upsert: удалить старую строку и вставить новую
+            await db.execute("DELETE FROM image_fts WHERE rowid = ?", (image_id,))
+            await db.execute(
+                "INSERT INTO image_fts(rowid, content) VALUES(?, ?)",
+                (image_id, build_index_text(tags))
+            )
+        await db.commit()
 
 # --------- STATE FOR EDITING TAGS ----------
 class EditStates(StatesGroup):
@@ -398,6 +552,7 @@ async def on_photo(m: Message):
         channel_message_id=sent.message_id,
         tags=tags,
     )
+    await fts_upsert(image_id, build_index_text(tags))
     await m.reply(
         "Сохранил ✅\n"
         f"Тегов: {len(tags)}\n"
@@ -467,23 +622,18 @@ async def on_sticker(m: Message):
 @dp.inline_query()
 async def on_inline_query(q: InlineQuery):
     user_id = q.from_user.id
-    tags = normalize_tags(q.query)
+    query = q.query or ""
     limit = 25
     offset = int(q.offset) if q.offset and q.offset.isdigit() else 0
 
-    rows = await search_images_for_user(user_id, tags, limit=limit, offset=offset)
-    results = []
-    for row in rows:
-        image_id = row["id"]
-        results.append(
-            InlineQueryResultCachedPhoto(
-                id=str(image_id),
-                photo_file_id=row["file_id"],
-            )
-        )
-
+    rows = await search_images_for_user_fts(user_id, query, limit=limit, offset=offset)
+    results = [
+        InlineQueryResultCachedPhoto(
+            id=str(r["id"]),
+            photo_file_id=r["file_id"],
+        ) for r in rows
+    ]
     next_offset = str(offset + len(results)) if len(results) == limit else ""
-    # ВАЖНО: cache_time=0 → не кешировать inline-выдачу
     await q.answer(results=results, cache_time=0, is_personal=True, next_offset=next_offset)
 
 # --------- RECEIVING INLINE MESSAGE IN BOT CHAT (FOR EDIT/DELETE) ----------
@@ -556,6 +706,7 @@ async def on_new_tags(m: Message, state: FSMContext):
     new_tags = normalize_tags(m.text or "")
     await add_image_tags(image_id, new_tags)  # <-- добавляем, не затираем
     all_tags = await get_image_tags(image_id)
+    await fts_upsert(image_id, build_index_text(all_tags))
 
     # обновим подпись в канале
     full_row = await get_image_row_any(image_id)
@@ -606,6 +757,7 @@ async def cb_clear_confirm(c: CallbackQuery):
         return
 
     await clear_image_tags(image_id)
+    await fts_upsert(image_id, build_index_text([]))
     full_row = await get_image_row_any(image_id)
     if full_row:
         await update_channel_caption(full_row, tags=[], mark_deleted=False)
@@ -670,6 +822,9 @@ async def fallback(m: Message):
 # --------- MAIN ----------
 async def main():
     await init_db()
+    await init_fts()
+    await ensure_fts_backfilled()  # пройдётся по существующим и заполнит FTS
+
     me = await bot.get_me()
     logger.info(f"Bot started as @{me.username}")
     await dp.start_polling(bot, allowed_updates=[
