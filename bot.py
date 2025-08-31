@@ -784,6 +784,26 @@ async def on_top_comment_text_prefill(m: Message):
     # можно молчать; если хочется — ответь кратко:
     # await m.reply("Принял теги. Теперь пришлите картинку — применю их.")
 
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: types.Message, state: FSMContext):
+    s = await state.get_state()
+    if not s:
+        await m.reply("Нечего отменять.")
+        return
+
+    data = await state.get_data()
+    image_id = data.get("image_id")
+    await state.clear()
+
+    # Пытаемся вернуть пользователю кнопки по картинке, если они есть
+    if image_id:
+        row = await get_image_row_any(image_id)
+        if row and row.get("uploader_user_id") == m.from_user.id:
+            await m.reply("Отменено.", reply_markup=action_keyboard(image_id))
+            return
+
+    await m.reply("Отменено.")
+
 # --------- ADDING PHOTOS (DIRECT CHAT) ----------
 @dp.message(F.photo)
 async def on_photo(m: Message, state: FSMContext):
@@ -869,7 +889,9 @@ async def on_photo(m: Message, state: FSMContext):
             await m.reply(
                 "Сохранил без тегов ✅\n"
                 "Режим «Верхняя подпись»: вы можете сначала прислать текст (теги), а затем фото — я их применю.\n"
-                "Либо отправьте текст **в ответ (reply) на эту картинку** — добавлю как теги.",
+                "Либо отправьте текст **в ответ (reply) на эту картинку** — добавлю как теги."
+                "\n"
+                "Отмена — /cancel",
                 reply_markup=action_keyboard(image_id),
             )
         else:  # off
@@ -1080,7 +1102,8 @@ async def cb_edit(c: CallbackQuery, state: FSMContext):
     await state.update_data(image_id=image_id)
     await c.message.answer(
         f"Текущие теги: {tags_to_caption(old_tags) or '—'}\n"
-        "Пришлите новые теги (через пробелы/запятые, можно с #)."
+        "Пришлите новые теги (через пробелы/запятые, можно с #).\n"
+        "Отмена — /cancel"
     )
     await c.answer()
 
