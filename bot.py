@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import time
 import asyncio
 import logging
 import html
@@ -20,6 +21,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
 
 import aiosqlite
 from PIL import Image
@@ -82,12 +84,16 @@ CREATE INDEX IF NOT EXISTS idx_images_unique ON images(file_unique_id);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON image_tags(tag);
 """
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        for stmt in CREATE_SQL.strip().split(";\n"):
-            if stmt.strip():
-                await db.execute(stmt)
-        await db.commit()
+TAG_MODE_TITLES = {
+    "off": "Выкл",
+    "followup": "Следующее сообщение",
+    "top_comment": "Верхняя подпись",
+}
+
+BOT_LINK = getattr(settings, "BOT_LINK", None)
+
+TOP_COMMENT_WINDOW_SEC = 120  # окно, в течение которого «верхняя подпись» валидна
+top_comment_cache = {}  # ключ: (chat_id, user_id) -> {"tags": List[str], "ts": float, "msg_id": int}
 
 def normalize_tags(text: Optional[str]) -> List[str]:
     if not text:
@@ -111,6 +117,39 @@ def normalize_tags(text: Optional[str]) -> List[str]:
             uniq.append(t)
     return uniq
 
+def _get_top_comment_tags(chat_id: int, user_id: int):
+    rec = top_comment_cache.get((chat_id, user_id))
+    if not rec:
+        return None
+    if time.time() - rec["ts"] > TOP_COMMENT_WINDOW_SEC:
+        top_comment_cache.pop((chat_id, user_id), None)
+        return None
+    return rec["tags"]
+
+async def bot_mention() -> str:
+    # Если в settings.py задано 'meetmemebot' или '@meetmemebot'
+    if BOT_LINK:
+        return "@" + str(BOT_LINK).lstrip("@")
+    me = await bot.get_me()
+    return f"@{me.username}"
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        for stmt in CREATE_SQL.strip().split(";\n"):
+            if stmt.strip():
+                await db.execute(stmt)
+        # ensure users.tag_mode
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("PRAGMA table_info(users)")
+        cols = {r["name"] for r in await cur.fetchall()}
+        if "tag_mode" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN tag_mode TEXT DEFAULT 'followup'")
+            if "tag_mode" not in cols:
+                await db.execute("ALTER TABLE users ADD COLUMN tag_mode TEXT DEFAULT 'followup'")
+                await db.execute("UPDATE users SET tag_mode='followup' WHERE tag_mode IS NULL")
+
+        await db.commit()
+
 async def upsert_user(m: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -123,6 +162,31 @@ async def upsert_user(m: Message):
             (m.from_user.id, m.from_user.username, m.from_user.first_name, m.from_user.last_name),
         )
         await db.commit()
+
+async def get_user_tag_mode(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT tag_mode FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        mode = (row["tag_mode"] if row and row["tag_mode"] else "followup")
+        return mode if mode in ("off", "followup", "top_comment") else "followup"
+
+async def set_user_tag_mode(user_id: int, mode: str):
+    if mode not in ("off", "followup", "top_comment"):
+        mode = "followup"
+    async with aiosqlite.connect(DB_PATH) as db:
+        # создаём или обновляем запись пользователя с нужным tag_mode
+        await db.execute(
+            """
+            INSERT INTO users(user_id, username, first_name, last_name, tag_mode)
+            VALUES (?, NULL, NULL, NULL, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                tag_mode = excluded.tag_mode
+            """,
+            (user_id, mode),
+        )
+        await db.commit()
+
 
 async def get_user(user_id: int) -> Optional[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -385,6 +449,11 @@ class EditStates(StatesGroup):
 
 # кеш тегов для медиа-групп (альбомов)
 media_group_tags_cache: Dict[str, List[str]] = {}
+# вверху файла рядом с media_group_tags_cache:
+pending_msg_to_image: Dict[tuple[int, int], int] = {}
+
+class AddStates(StatesGroup):
+    waiting_initial_tags = State()
 
 # --------- HELPERS ----------
 def tags_to_caption(tags: List[str]) -> str:
@@ -492,32 +561,92 @@ async def clear_image_tags(image_id: int):
         await db.execute("DELETE FROM image_tags WHERE image_id=?", (image_id,))
         await db.commit()
 
+@dp.message(Command("tags_mode"))
+async def cmd_tags_mode(m: Message):
+    await upsert_user(m)
+    mode = await get_user_tag_mode(m.from_user.id)
+
+    kb = InlineKeyboardBuilder()
+    for key in ("off", "followup", "top_comment"):
+        prefix = "✅ " if key == mode else ""
+        kb.button(text=prefix + TAG_MODE_TITLES[key], callback_data=f"tagmode:{key}")
+    kb.adjust(1)
+
+    human = TAG_MODE_TITLES.get(mode, mode)
+    await m.reply(f"Текущий режим автотегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("tagmode:"))
+async def cb_tagmode(c: CallbackQuery):
+    mode = c.data.split(":")[1]
+    await set_user_tag_mode(c.from_user.id, mode)
+
+    # перерисуем клавиатуру с новой галочкой
+    kb = InlineKeyboardBuilder()
+    for key in ("off", "followup", "top_comment"):
+        prefix = "✅ " if key == mode else ""
+        kb.button(text=prefix + TAG_MODE_TITLES[key], callback_data=f"tagmode:{key}")
+    kb.adjust(1)
+
+    human = TAG_MODE_TITLES.get(mode, mode)
+    await c.message.edit_text(f"Текущий режим автотегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
+    await c.answer("Готово")
+
 # --------- COMMANDS ----------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await upsert_user(m)
+    mention = await bot_mention()
     await m.answer(
         "Привет! Я помогу хранить твои картинки с тегами.\n\n"
         "Как пользоваться:\n"
         "• Пришли фото с тегами в подписи — я сохраню их.\n"
-        "• В inline-режиме (набор @бот в любом чате) ищи по своим тегам.\n"
-        "• Чтобы отредактировать/удалить — пришли картинку в чат со мной через inline, я покажу кнопки."
+        f"• В inline-режиме (набери {mention} в любом чате) ищи по своим тегам.\n"
+        "• Чтобы отредактировать/удалить — пришли картинку в чат со мной через inline, я покажу кнопки.\n"
+        "\n"
+        "Для помощи введи /help."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
+    mention = await bot_mention()
     await m.answer(
         "Добавление: пришли фото(а) с подписью вида: #кот, хвост, пушистый\n"
-        "Поиск: в любом чате наберите @meetmemebot и теги\n"
-        "Редактирование/удаление: пришлите найденную inline картинку сюда — появятся кнопки."
+        f"Поиск: в любом чате наберите {mention} и теги\n"
+        "Редактирование/удаление: пришлите найденную inline картинку сюда — появятся кнопки.\n"
+        "\n"
+        "Так же можно редактировать поведение заполнения тегов, попробуй через /tags_mode."
     )
+
+# @dp.message(F.text & ~F.reply_to_message)
+@dp.message(StateFilter(None), F.text & ~F.reply_to_message)
+async def on_top_comment_text_prefill(m: Message):
+    # работаем только в режиме top_comment
+    mode = await get_user_tag_mode(m.from_user.id)
+    if mode != "top_comment":
+        return
+    # не перехватываем команды
+    if (m.text or "").strip().startswith("/"):
+        return
+
+    tags = normalize_tags(m.text or "")
+    if not tags:
+        return
+
+    # запоминаем теги для следующего файла от этого пользователя в этом чате
+    top_comment_cache[(m.chat.id, m.from_user.id)] = {
+        "tags": tags,
+        "ts": time.time(),
+        "msg_id": m.message_id,
+    }
+    # можно молчать; если хочется — ответь кратко:
+    # await m.reply("Принял теги. Теперь пришлите картинку — применю их.")
 
 # --------- ADDING PHOTOS (DIRECT CHAT) ----------
 @dp.message(F.photo)
-async def on_photo(m: Message):
+async def on_photo(m: Message, state: FSMContext):
     await upsert_user(m)
 
-    # Если фото прислали в чат с ботом через inline этого же бота — не сохраняем, просто показываем меню
+    # 0) Если фото прислали в чат с ботом через inline ЭТОГО ЖЕ бота — не сохраняем повторно, просто показываем меню
     me = await bot.get_me()
     if m.via_bot and m.via_bot.id == me.id:
         unique = m.photo[-1].file_unique_id
@@ -533,14 +662,32 @@ async def on_photo(m: Message):
         await m.reply(f"Ваши теги: {tags_line}\nВыберите действие:", reply_markup=action_keyboard(row["id"]))
         return
 
-    # Обычный сценарий добавления (НЕ через inline)
-    tags = normalize_tags(m.caption)
-    if m.media_group_id:
-        gid = str(m.media_group_id)
-        if tags:
-            media_group_tags_cache[gid] = tags
-        else:
-            tags = media_group_tags_cache.get(gid, [])
+    # 1) Выбираем теги с учётом режима автотегов
+    mode = await get_user_tag_mode(m.from_user.id)
+    tags: List[str] = []
+
+    # 1.1) Приоритет: режим top_comment — используем заранее присланный текст (верхнюю подпись), если он есть в кэше
+    if mode == "top_comment":
+        tmp = _get_top_comment_tags(m.chat.id, m.from_user.id)
+        if tmp:
+            tags = tmp
+            # если это альбом — применим ко всем элементам группы
+            if m.media_group_id:
+                media_group_tags_cache[str(m.media_group_id)] = tags
+            # поглощаем буфер, чтобы не применился повторно
+            top_comment_cache.pop((m.chat.id, m.from_user.id), None)
+
+    # 1.2) Если буфера нет — стандартно берём caption/кэш медиагруппы
+    if not tags:
+        tags = normalize_tags(m.caption)
+        if m.media_group_id:
+            gid = str(m.media_group_id)
+            if tags:
+                media_group_tags_cache[gid] = tags
+            else:
+                tags = media_group_tags_cache.get(gid, [])
+
+    # 2) Отправляем в канал, сохраняем запись
     src_file_id = m.photo[-1].file_id
     sent = await send_photo_to_channel_from_file_id(src_file_id, m.from_user, tags)
     saved_photo = sent.photo[-1]
@@ -552,11 +699,116 @@ async def on_photo(m: Message):
         channel_message_id=sent.message_id,
         tags=tags,
     )
+
+    # 2.1) Индексируем FTS (оригиналы + леммы)
     await fts_upsert(image_id, build_index_text(tags))
+
+    # 2.2) Привязываем исходное сообщение к image_id (чтобы можно было ответить текстом на фото и добросить теги)
+    pending_msg_to_image[(m.chat.id, m.message_id)] = image_id
+
+    # 3) Ответ пользователю
+    mention = await bot_mention()
+    if tags:
+        await m.reply(
+            "Сохранил ✅\n"
+            f"Тегов: {len(tags)}\n"
+            f"Подсказка: открой inline ({mention}) и введи теги для поиска.",
+            reply_markup=action_keyboard(image_id),
+        )
+    else:
+        if mode == "followup":
+            # ждём следующее сообщение как теги
+            await state.set_state(AddStates.waiting_initial_tags)
+            await state.update_data(image_id=image_id)
+            await m.reply("Не вижу тегов. Пришлите следующим сообщением теги для этой картинки (через пробелы/запятые, можно с #).")
+        elif mode == "top_comment":
+            # режим верхней подписи: пользователь мог забыть прислать текст заранее — подскажем вариант reply
+            await m.reply(
+                "Сохранил без тегов ✅\n"
+                "Режим «Верхняя подпись»: вы можете сначала прислать текст (теги), а затем фото — я их применю.\n"
+                "Либо отправьте текст **в ответ (reply) на эту картинку** — добавлю как теги.",
+                reply_markup=action_keyboard(image_id),
+            )
+        else:  # off
+            await m.reply(
+                "Сохранил без тегов ✅\n"
+                "Автосбор тегов выключен (/tags_mode). Теги можно добавить позже через «✏️ Редактировать теги».",
+                reply_markup=action_keyboard(image_id),
+            )
+
+@dp.message(AddStates.waiting_initial_tags)
+async def on_initial_tags(m: Message, state: FSMContext):
+    data = await state.get_data()
+    image_id = data.get("image_id")
+    row = await get_image_row_any(image_id)
+    if not row or row.get("deleted_at"):
+        await m.reply("Картинка не найдена (возможно, удалена).")
+        await state.clear()
+        return
+    if row["uploader_user_id"] != m.from_user.id:
+        await m.reply("Недостаточно прав.")
+        await state.clear()
+        return
+
+    new_tags = normalize_tags(m.text or "")
+    await add_image_tags(image_id, new_tags)
+    all_tags = await get_image_tags(image_id)
+
+    # обновляем подпись в канале + индекс
+    await update_channel_caption(row, tags=all_tags, mark_deleted=False)
+    await fts_upsert(image_id, build_index_text(all_tags))
+
     await m.reply(
-        "Сохранил ✅\n"
-        f"Тегов: {len(tags)}\n"
-        f"Подсказка: открой inline (@{(await bot.get_me()).username}) и введи теги для поиска.",
+        f"Добавил: {tags_to_caption(new_tags) or '—'}\nИтоговые теги: {tags_to_caption(all_tags) or '—'}",
+        reply_markup=action_keyboard(image_id),
+    )
+    await state.clear()
+
+# @dp.message(F.text & F.reply_to_message)
+@dp.message(StateFilter(None), F.text & F.reply_to_message)
+async def on_text_reply_as_top_comment(m: Message):
+    mode = await get_user_tag_mode(m.from_user.id)
+    if mode != "top_comment":
+        return
+
+    r = m.reply_to_message
+    image_id = None
+
+    # 1) пробуем найти по кэшу «сообщение → image_id»
+    key = (r.chat.id, r.message_id)
+    if key in pending_msg_to_image:
+        image_id = pending_msg_to_image[key]
+
+    # 2) иначе — по file_unique_id из ответа
+    if not image_id:
+        if r.photo:
+            unique = r.photo[-1].file_unique_id
+        elif r.document and r.document.mime_type and r.document.mime_type.startswith("image/"):
+            unique = r.document.file_unique_id
+        else:
+            return
+        row0 = await get_image_by_unique(unique)
+        if row0:
+            image_id = row0["id"]
+
+    if not image_id:
+        return
+
+    row = await get_image_row_any(image_id)
+    if not row or row.get("deleted_at"):
+        return
+    if row["uploader_user_id"] != m.from_user.id:
+        return
+
+    new_tags = normalize_tags(m.text or "")
+    await add_image_tags(image_id, new_tags)
+    all_tags = await get_image_tags(image_id)
+
+    await update_channel_caption(row, tags=all_tags, mark_deleted=False)
+    await fts_upsert(image_id, build_index_text(all_tags))
+
+    await m.reply(
+        f"Добавил: {tags_to_caption(new_tags) or '—'}\nИтоговые теги: {tags_to_caption(all_tags) or '—'}",
         reply_markup=action_keyboard(image_id),
     )
 
@@ -807,11 +1059,11 @@ async def cb_delete_confirm(c: CallbackQuery):
     if full_row:
         await update_channel_caption(full_row, tags=None, mark_deleted=True)
 
-    await c.message.edit_text("Элемент удален.")
+    await c.message.edit_text("Картиночка удалена.")
     await c.answer("Готово.")
 
 # --------- FALLBACK: неподдерживаемый контент ----------
-@dp.message()
+@dp.message(StateFilter(None))
 async def fallback(m: Message):
     # Отвечаем только на вложения, которые мы не обрабатываем (текст игнорируем)
     if m.content_type not in ("text", "photo", "sticker"):
