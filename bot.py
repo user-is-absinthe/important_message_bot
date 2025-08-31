@@ -21,12 +21,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import StateFilter
+
 
 import aiosqlite
 from PIL import Image
 
 import pymorphy3
+from attr.validators import optional
+
 morph = pymorphy3.MorphAnalyzer()
 
 # --------- SETTINGS ----------
@@ -91,6 +95,8 @@ TAG_MODE_TITLES = {
 }
 
 BOT_LINK = getattr(settings, "BOT_LINK", None)
+
+MENU_BUTTON_LABELS = ("❓ Помощь", "⚙️ Режим тегов", "🧨 Очистить галерею")
 
 TOP_COMMENT_WINDOW_SEC = 120  # окно, в течение которого «верхняя подпись» валидна
 top_comment_cache = {}  # ключ: (chat_id, user_id) -> {"tags": List[str], "ts": float, "msg_id": int}
@@ -480,6 +486,18 @@ def compose_channel_caption(user_id: int, first_name: Optional[str], last_name: 
     deleted_line = f"\n<i>❌ Удалено пользователем {escape(deleted_at)}</i>" if deleted_at else ""
     return header + (("\n\n" + tags_line) if tags_line else "") + deleted_line
 
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="⚙️ Режим тегов")],
+            [KeyboardButton(text="🧨 Очистить галерею")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Отправьте фото или используйте кнопки",
+        one_time_keyboard=False,
+        selective=False,
+    )
+
 async def update_channel_caption(image_row: dict, tags: Optional[List[str]] = None, mark_deleted: bool = False):
     """Пересобираем подпись и обновляем её в канале."""
     user = await get_user(image_row["uploader_user_id"])
@@ -573,7 +591,10 @@ async def cmd_tags_mode(m: Message):
     kb.adjust(1)
 
     human = TAG_MODE_TITLES.get(mode, mode)
-    await m.reply(f"Текущий режим автотегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
+    optional_description = ('\n\n"Выкл" — теги для каждой картинки надо вводить вручную\n'
+                            '"Следующее сообщение" — тегами считается любое следующее текстовове сообщение после картинки\n'
+                            '"Верхняя подпись" — тегами считается предыдущее сообщение (как телеграм делает, если переслать сообщение и в той же форме добавить комментарий')
+    await m.reply(f"Текущий режим тегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("tagmode:"))
 async def cb_tagmode(c: CallbackQuery):
@@ -588,8 +609,127 @@ async def cb_tagmode(c: CallbackQuery):
     kb.adjust(1)
 
     human = TAG_MODE_TITLES.get(mode, mode)
-    await c.message.edit_text(f"Текущий режим автотегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
+    await c.message.edit_text(f"Текущий режим тегов: {human}\nВыберите вариант:", reply_markup=kb.as_markup())
     await c.answer("Готово")
+
+# --------- Делаем кнопочки меню ---------
+@dp.message(StateFilter(None), F.text == "❓ Помощь")
+async def btn_help(m: Message):
+    await cmd_help(m)
+
+@dp.message(StateFilter(None), F.text == "⚙️ Режим тегов")
+async def btn_tagmode(m: Message):
+    await cmd_tags_mode(m)
+
+@dp.message(StateFilter(None), F.text == "🧨 Очистить галерею")
+async def btn_wipe_gallery(m: Message, state: FSMContext):
+    # Если пользователь был в процессе ввода тегов — лучше сбросить ожидание,
+    # чтобы не мешать очистке (по желанию можно убрать)
+    try:
+        await state.clear()
+    except Exception:
+        pass
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, удалить всё", callback_data="wipe:1:yes")
+    kb.button(text="↩️ Отмена", callback_data="wipe:1:no")
+    kb.adjust(1, 1)
+    await m.reply(
+        "Удалить **всю вашу галерею**? Это действие скроет все ваши изображения из поиска (шаг 1/2).",
+        reply_markup=kb.as_markup(),
+        disable_web_page_preview=True,
+    )
+
+async def wipe_user_gallery(user_id: int) -> int:
+    """Помечает все изображения пользователя как удалённые, правит подписи в канале и чистит FTS.
+       Возвращает количество помеченных изображений."""
+    # заберём список активных
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM images WHERE uploader_user_id=? AND deleted_at IS NULL ORDER BY id DESC",
+            (user_id,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    count = 0
+    for row in rows:
+        await soft_delete_image(row["id"])
+        # пометка «Удалено пользователем …» в канале
+        try:
+            await update_channel_caption(row, tags=None, mark_deleted=True)
+        except Exception as e:
+            logger.warning(f"update_channel_caption failed for {row['id']}: {e}")
+        # чистим FTS-индекс (не обязательно, но полезно)
+        try:
+            await fts_delete(row["id"])
+        except Exception as e:
+            logger.warning(f"fts_delete failed for {row['id']}: {e}")
+        count += 1
+    return count
+
+@dp.callback_query(F.data.startswith("wipe:"))
+async def cb_wipe(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split(":")
+    # формат: wipe:<stage>:<yes|no>
+    if len(parts) != 3:
+        await c.answer()
+        return
+    _, stage, choice = parts
+
+    # Отмена на любом шаге
+    if choice == "no":
+        try:
+            await c.message.edit_text("Очистка отменена.")
+        except Exception:
+            await c.message.answer("Очистка отменена.")
+        await c.answer("Отмена")
+        return
+
+    # Шаг 1 → спросить второй раз
+    if stage == "1" and choice == "yes":
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔥 Да, удалить навсегда", callback_data="wipe:2:yes")
+        kb.button(text="↩️ Отмена", callback_data="wipe:2:no")
+        kb.adjust(1, 1)
+        try:
+            await c.message.edit_text(
+                "Подтвердите ещё раз: **удалить всю вашу галерею навсегда**? (шаг 2/2)",
+                reply_markup=kb.as_markup(),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await c.message.answer(
+                "Подтвердите ещё раз: **удалить всю вашу галерею навсегда**? (шаг 2/2)",
+                reply_markup=kb.as_markup(),
+            )
+        await c.answer()
+        return
+
+    # Шаг 2 → выполняем очистку
+    if stage == "2" and choice == "yes":
+        user_id = c.from_user.id
+        # на всякий случай сбросимFSM
+        try:
+            await state.clear()
+        except Exception:
+            pass
+
+        await c.answer("Очищаю…")
+        deleted = await wipe_user_gallery(user_id)
+
+        text = (
+            f"Готово. Пометил как удалённые: {deleted}.\n"
+            "Эти изображения больше не будут находиться в inline-поиске.\n"
+            "Отменить операцию нельзя."
+        )
+        try:
+            await c.message.edit_text(text)
+        except Exception:
+            await c.message.answer(text)
+        return
+
+    await c.answer()
 
 # --------- COMMANDS ----------
 @dp.message(CommandStart())
@@ -601,9 +741,8 @@ async def cmd_start(m: Message):
         "Как пользоваться:\n"
         "• Пришли фото с тегами в подписи — я сохраню их.\n"
         f"• В inline-режиме (набери {mention} в любом чате) ищи по своим тегам.\n"
-        "• Чтобы отредактировать/удалить — пришли картинку в чат со мной через inline, я покажу кнопки.\n"
-        "\n"
-        "Для помощи введи /help."
+        "• Чтобы отредактировать/удалить — пришли картинку в чат со мной через inline, я покажу кнопки.",
+        reply_markup=main_menu_kb(),
     )
 
 @dp.message(Command("help"))
@@ -611,14 +750,18 @@ async def cmd_help(m: Message):
     mention = await bot_mention()
     await m.answer(
         "Добавление: пришли фото(а) с подписью вида: #кот, хвост, пушистый\n"
-        f"Поиск: в любом чате наберите {mention} и теги\n"
+        f"Поиск: в любом чате набери {mention} и теги\n"
         "Редактирование/удаление: пришлите найденную inline картинку сюда — появятся кнопки.\n"
         "\n"
-        "Так же можно редактировать поведение заполнения тегов, попробуй через /tags_mode."
+        f"Для просмотра всех своих сохраненных картинок просто введи {mention} в любом чате.",
+        reply_markup=main_menu_kb(),
     )
 
 # @dp.message(F.text & ~F.reply_to_message)
-@dp.message(StateFilter(None), F.text & ~F.reply_to_message)
+@dp.message(
+    StateFilter(None),
+    F.text & ~F.reply_to_message & ~F.text.in_(MENU_BUTTON_LABELS)
+)
 async def on_top_comment_text_prefill(m: Message):
     # работаем только в режиме top_comment
     mode = await get_user_tag_mode(m.from_user.id)
@@ -662,7 +805,7 @@ async def on_photo(m: Message, state: FSMContext):
         await m.reply(f"Ваши теги: {tags_line}\nВыберите действие:", reply_markup=action_keyboard(row["id"]))
         return
 
-    # 1) Выбираем теги с учётом режима автотегов
+    # 1) Выбираем теги с учётом режима тегов
     mode = await get_user_tag_mode(m.from_user.id)
     tags: List[str] = []
 
